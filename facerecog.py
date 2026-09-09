@@ -25,9 +25,9 @@ except ImportError:
 # ============================================================================
 
 # !! Use raw crops, NOT enlarged/enhanced crops !!
-DETECTED_FACES_FOLDER = r"C:\Users\Rajarshi\OneDrive\Desktop\Robo dog\results\face_crops"
+DETECTED_FACES_FOLDER = r"C:\Users\quant\OneDrive\Desktop\ROVER-FEATURE\results\face_crops"
 
-KNOWN_FACES_FOLDER = r"C:\Users\Rajarshi\OneDrive\Desktop\Robo dog\known_faces"
+KNOWN_FACES_FOLDER = r"C:\Users\quant\OneDrive\Desktop\ROVER-FEATURE\known_faces"
 
 # Threshold: 0.30 = lenient, 0.40 = normal, 0.50 = strict
 MATCH_THRESHOLD = 0.30

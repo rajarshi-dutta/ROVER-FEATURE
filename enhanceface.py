@@ -3,8 +3,8 @@ import numpy as np
 import os
 
 # ---------- CONFIG ----------
-CROPS_FOLDER = "C:/Users/Rajarshi/OneDrive/Desktop/Robo dog/results/face_crops"
-OUTPUT_FOLDER = "C:/Users/Rajarshi/OneDrive/Desktop/Robo dog/results/fresh_face"
+CROPS_FOLDER = r"C:\Users\quant\OneDrive\Desktop\ROVER-FEATURE\results\face_crops"
+OUTPUT_FOLDER = r"C:\Users\quant\OneDrive\Desktop\ROVER-FEATURE\results\fresh_face"
 ENHANCEMENT_METHOD = 4  # Choose method: 1-8 (see options below)
 # 1 = Basic (your current), 2 = Bilateral, 3 = Contrast, 4 = Unsharp, 
 # 5 = Multi-Channel, 6 = Multi-Scale, 7 = Morphological, 8 = Aggressive
@@ -263,11 +263,3 @@ print(f"Done! {processed} enhanced face(s) saved")
 print(f"Average brightness: {total_brightness/max(processed, 1):.1f}")
 print(f"Output folder: {OUTPUT_FOLDER}")
 print(f"{'='*60}\n")
-
-# Recommendation
-print("Method Selection Guide:")
-print("  1: Your current method (fast, proven)")
-print("  2: Recommended for most cases (quality + speed)")
-print("  3: Better contrast recovery")
-print("  4: Best for face recognition (sharp details)")
-print("  8: For extremely dark images")
