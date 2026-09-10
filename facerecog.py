@@ -33,6 +33,7 @@ import numpy as np
 import os
 import threading
 from pathlib import Path
+from dotenv import load_dotenv
 
 try:
     from insightface.app import FaceAnalysis
@@ -40,12 +41,13 @@ except ImportError:
     raise ImportError("Run: pip install insightface onnxruntime opencv-python numpy")
 
 
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-
-KNOWN_FACES_FOLDER = r"C:\Users\Rajarshi\OneDrive\Desktop\Robo dog\known_faces"
-UNKNOWN_FACES_FOLDER = r"C:\Users\Rajarshi\OneDrive\Desktop\Robo dog\results\unknown_faces"
+load_dotenv()
+KNOWN_FACES_FOLDER = os.getenv("kface")
+UNKNOWN_FACES_FOLDER = os.getenv("uface")
 
 MATCH_THRESHOLD = 0.30           # known-face match threshold
 UNKNOWN_DEDUP_THRESHOLD = 0.35   # "same unrecognized person" threshold — stricter

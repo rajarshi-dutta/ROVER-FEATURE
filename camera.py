@@ -27,15 +27,16 @@ from ultralytics import YOLO
 import cv2
 import time
 import threading
-
+import os
+from dotenv import load_dotenv
 import facerecog
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-
+load_dotenv()
 MODEL_PATH = "blacknwhite.pt"
-SNAPSHOT_URL = "http://192.168.29.112:81/stream"
+SNAPSHOT_URL = os.getenv("videourl")
 SNAPSHOT_DELAY = 0.1  # seconds between frames
 CONF_THRESHOLD = 0.5
 
