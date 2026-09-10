@@ -1,0 +1,19 @@
+# Robo Dog — Face Detection & Recognition Pipeline
+# ==================================================
+# Install with: pip install -r requirements.txt
+
+# YOLO face detection (camera.py) — also pulls in torch/torchvision
+ultralytics>=8.2.0
+
+# Camera stream capture, image I/O, face-crop handling
+opencv-python>=4.9.0
+
+# Embedding math (cosine similarity, array ops)
+numpy>=1.26.0
+
+# Face recognition — embeddings + known/unknown-face matching (facerecog.py)
+insightface>=0.7.3
+onnxruntime>=1.17.0
+
+# Loads kface / uface / videourl from .env (camera.py, facerecog.py)
+python-dotenv>=1.0.0
