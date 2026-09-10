@@ -1,17 +1,37 @@
 """
-Face Matching System — InsightFace ArcFace
-==========================================
-IMPORTANT: Point this at face_crops (raw) NOT face_crops_enlarged.
-Enhancement and upscaling help human viewing, NOT ArcFace recognition.
-ArcFace does its own internal normalization to 112×112.
+Face Recognition Module — Direct In-Memory Matching + Unknown-Face Dedup
+==========================================================================
+camera.py calls identify_face(face_crop) directly for every detected face,
+in memory, before anything is written to disk.
 
-Install:
-    pip install insightface onnxruntime opencv-python numpy
+This module now owns the full decision for unknown faces too:
+  1. Compare the face against the known-faces DB (enrolled photos).
+  2. If it doesn't match anyone known, compare it against faces already
+     saved in the unknown-faces folder (by embedding similarity, not a
+     perceptual hash — much more robust to angle/lighting changes).
+  3. If a similar unknown face already exists there, skip saving (it's
+     the same unrecognized person as before).
+  4. Otherwise, save the crop into the unknown-faces folder and remember
+     its embedding so future frames of the same person get skipped too.
+
+Usage:
+    import facerecog
+
+    facerecog.init_recognition()                  # once, at startup
+    result = facerecog.identify_face(face_crop)    # per detected face
+
+    result["status"] is one of:
+        "MATCHED"       -> known person, already discarded (nothing saved)
+        "NEW_UNKNOWN"   -> unknown face, newly saved (see result["saved_path"])
+        "DUPLICATE"     -> unknown face, but already saved before (skipped)
+        "NO_FACE"       -> crop was too poor to get an embedding from
+        "ERROR"         -> empty/invalid crop
 """
 
 import cv2
 import numpy as np
 import os
+import threading
 from pathlib import Path
 
 try:
@@ -21,76 +41,95 @@ except ImportError:
 
 
 # ============================================================================
-# CONFIGURATION  ← only edit this section
+# CONFIGURATION
 # ============================================================================
 
-# !! Use raw crops, NOT enlarged/enhanced crops !!
-DETECTED_FACES_FOLDER = r"C:\Users\quant\OneDrive\Desktop\ROVER-FEATURE\results\face_crops"
+KNOWN_FACES_FOLDER = r"C:\Users\Rajarshi\OneDrive\Desktop\Robo dog\known_faces"
+UNKNOWN_FACES_FOLDER = r"C:\Users\Rajarshi\OneDrive\Desktop\Robo dog\results\unknown_faces"
 
-KNOWN_FACES_FOLDER = r"C:\Users\quant\OneDrive\Desktop\ROVER-FEATURE\known_faces"
-
-# Threshold: 0.30 = lenient, 0.40 = normal, 0.50 = strict
-MATCH_THRESHOLD = 0.30
-
-# If crops are tiny (< 80px), upscale before sending to InsightFace
-# This is different from your pipeline upscaling — this is purely for detection
-MIN_FACE_SIZE = 80   # pixels (shorter side)
-
+MATCH_THRESHOLD = 0.30           # known-face match threshold
+UNKNOWN_DEDUP_THRESHOLD = 0.35   # "same unrecognized person" threshold — stricter
+                                  # than MATCH_THRESHOLD since a false dedup-skip
+                                  # just means one fewer photo of the same stranger.
+MIN_FACE_SIZE = 120
 
 # ============================================================================
-# MODEL  — loaded once
-# ============================================================================
 
-print("Loading InsightFace model…")
-_APP = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-_APP.prepare(ctx_id=0, det_size=(320, 320))   # smaller det_size = finds smaller faces
-print("Model ready.\n")
+# Global state
+_APP = None
+_MODEL_LOCK = threading.Lock()
+_known_db = {}
+_db_lock = threading.Lock()
+_ready = False
+
+# Unknown-faces state: filename -> embedding
+_unknown_db = {}
+_unknown_lock = threading.Lock()
+_unknown_counter = 0
 
 
-# ============================================================================
-# HELPERS
-# ============================================================================
+def init_recognition():
+    """
+    Load the InsightFace model, build the known-faces database, and load
+    any unknown faces already saved on disk (e.g. from a previous run) so
+    dedup keeps working across restarts.
+    Call this once at startup, before the camera loop begins.
+    """
+    global _ready
+    _init_model()
+    _build_known_db()
+    _load_existing_unknowns()
+    _ready = True
+    print("[FACEREC] Ready for direct frame-by-frame matching.\n")
+
+
+def is_ready():
+    return _ready
+
+
+def _init_model():
+    global _APP
+    if _APP is None:
+        print("[FACEREC] Loading InsightFace model…")
+        _APP = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+        _APP.prepare(ctx_id=0, det_size=(320, 320))
+        print("[FACEREC] Model ready.\n")
+
 
 def _preprocess(image: np.ndarray) -> np.ndarray:
-    """
-    Prepare a face crop for InsightFace:
-    - If the crop is tiny, upscale it so the detector can find the face.
-    - Do NOT apply enhancement — it distorts the embedding.
-    """
+    """Prepare a face crop for InsightFace — upscale if tiny."""
     h, w = image.shape[:2]
     short_side = min(h, w)
 
     if short_side < MIN_FACE_SIZE:
-        scale  = MIN_FACE_SIZE / short_side
-        new_w  = int(w * scale)
-        new_h  = int(h * scale)
-        image  = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+        scale = MIN_FACE_SIZE / short_side
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
 
     return image
 
 
-def _get_embedding(image: np.ndarray, path_hint: str = "") -> np.ndarray | None:
-    """
-    Extract ArcFace embedding from a face crop.
-    Falls back to a larger det_size if the first attempt fails.
-    """
-    img = _preprocess(image)
-    faces = _APP.get(img)
+def _get_embedding(image: np.ndarray):
+    """Extract ArcFace embedding from a face crop (thread-safe)."""
+    global _APP
 
-    # If nothing found, try a larger detection window
-    if not faces:
-        h, w  = img.shape[:2]
-        # pad the image so the detector has more context
-        pad   = max(h, w) // 4
-        padded = cv2.copyMakeBorder(img, pad, pad, pad, pad,
-                                    cv2.BORDER_CONSTANT, value=(128, 128, 128))
-        faces = _APP.get(padded)
+    img = _preprocess(image)
+
+    with _MODEL_LOCK:
+        faces = _APP.get(img)
+
+        if not faces:
+            h, w = img.shape[:2]
+            pad = max(h, w) // 4
+            padded = cv2.copyMakeBorder(img, pad, pad, pad, pad,
+                                       cv2.BORDER_CONSTANT, value=(128, 128, 128))
+            faces = _APP.get(padded)
 
     if not faces:
         return None
 
-    best = max(faces,
-               key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+    best = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
     return best.normed_embedding
 
 
@@ -98,171 +137,207 @@ def _cosine(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b))
 
 
-def _load_image(path: str) -> np.ndarray | None:
-    img = cv2.imread(path)
-    if img is None:
-        print(f"  [!] Cannot read: {path}")
-    return img
+def _build_known_db():
+    """Build known faces database once at startup."""
+    global _known_db
 
-
-# ============================================================================
-# BUILD KNOWN DATABASE
-# ============================================================================
-
-def build_known_db(known_folder: str) -> dict[str, np.ndarray]:
-    exts   = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-    folder = Path(known_folder)
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    folder = Path(KNOWN_FACES_FOLDER)
 
     if not folder.exists():
-        raise FileNotFoundError(f"Known faces folder not found: {known_folder}")
+        print(f"[FACEREC] Known faces folder not found: {KNOWN_FACES_FOLDER}")
+        return
 
     images = [p for p in folder.iterdir() if p.suffix.lower() in exts]
     if not images:
-        raise ValueError(f"No images found in: {known_folder}")
+        print(f"[FACEREC] No images found in: {KNOWN_FACES_FOLDER}")
+        return
 
-    print(f"Building known-face database from {len(images)} image(s)…")
-    db: dict[str, np.ndarray] = {}
+    print(f"[FACEREC] Building known-face database from {len(images)} image(s)…")
+    db = {}
 
     for img_path in images:
-        img = _load_image(str(img_path))
+        img = cv2.imread(str(img_path))
         if img is None:
             continue
 
         h, w = img.shape[:2]
-        print(f"  Reading: {img_path.name}  ({w}×{h} px)")
+        print(f"[FACEREC]   Reading: {img_path.name}  ({w}×{h} px)")
 
-        emb = _get_embedding(img, str(img_path))
+        emb = _get_embedding(img)
         if emb is None:
-            print(f"  [!] No face detected in known image: {img_path.name}")
-            print(f"      → Make sure the photo is a clear, well-lit, front-facing shot")
+            print(f"[FACEREC]   [!] No face detected in: {img_path.name}")
             continue
 
-        name    = img_path.stem.replace("_", " ").replace("-", " ").title()
+        name = img_path.stem.replace("_", " ").replace("-", " ").title()
         db[name] = emb
-        print(f"  ✓ Enrolled: {name}")
+        print(f"[FACEREC]   ✓ Enrolled: {name}")
 
-    if not db:
-        raise ValueError("No faces could be enrolled. Check your known_faces images.")
+    with _db_lock:
+        _known_db = db
 
-    print(f"\nDatabase ready — {len(db)} person(s): {', '.join(db)}\n")
-    return db
+    if db:
+        print(f"[FACEREC] Database ready — {len(db)} person(s): {', '.join(db)}\n")
+    else:
+        print(f"[FACEREC] Warning: No faces enrolled in database.\n")
 
 
-# ============================================================================
-# MATCH ALL FACES
-# ============================================================================
+def _load_existing_unknowns():
+    """
+    On startup, embed any unknown faces already saved on disk so dedup
+    keeps working across restarts instead of re-saving the same stranger.
+    """
+    global _unknown_db, _unknown_counter
 
-def match_all_faces(source_folder: str, known_folder: str,
-                    threshold: float = 0.30) -> list[dict]:
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    folder = Path(UNKNOWN_FACES_FOLDER)
+    folder.mkdir(parents=True, exist_ok=True)
 
-    print(f"\n{'='*70}")
-    print("Face Matching  —  InsightFace ArcFace")
-    print(f"{'='*70}")
-    print(f"  Detected faces : {source_folder}")
-    print(f"  Known faces    : {known_folder}")
-    print(f"  Threshold      : {threshold:.2f}\n")
+    images = sorted(p for p in folder.iterdir() if p.suffix.lower() in exts)
+    if not images:
+        _unknown_counter = 0
+        return
 
-    if not os.path.exists(source_folder):
-        raise FileNotFoundError(f"Source folder not found: {source_folder}")
+    print(f"[FACEREC] Loading {len(images)} existing unknown face(s) for dedup…")
+    db = {}
+    max_index = -1
 
-    db = build_known_db(known_folder)
-
-    exts  = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-    files = sorted(f for f in os.listdir(source_folder)
-                   if Path(f).suffix.lower() in exts)
-
-    print(f"Found {len(files)} detected face(s) to match\n")
-    all_matches: list[dict] = []
-
-    for idx, filename in enumerate(files, 1):
-        path = os.path.join(source_folder, filename)
-        img  = _load_image(path)
-
-        print(f"{idx}. {filename}")
-
+    for img_path in images:
+        img = cv2.imread(str(img_path))
         if img is None:
-            print("   ✗ Could not read image\n")
             continue
 
-        h, w = img.shape[:2]
-        print(f"   Size: {w}×{h} px", end="")
-
-        emb = _get_embedding(img, path)
-
+        emb = _get_embedding(img)
         if emb is None:
-            print("  →  ✗ No face detected")
-            print(f"      Tip: crop is {w}×{h} px — "
-                  + ("very small, try lowering MIN_FACE_SIZE or increasing UPSCALE_FACTOR in pipeline"
-                     if min(w, h) < 60 else
-                     "face may be blurry, occluded, or at a sharp angle"))
-            print()
-            all_matches.append({"detected_image": filename,
-                                 "matched_person": "NO_FACE",
-                                 "similarity": 0.0, "status": "NO_FACE"})
             continue
 
-        # Compare against all known faces
-        results = sorted(
-            [{"person_name": name,
-              "similarity":  round(_cosine(emb, known_emb), 4)}
-             for name, known_emb in db.items()],
-            key=lambda r: r["similarity"], reverse=True
-        )
-        best = results[0]
+        db[img_path.name] = emb
 
-        if best["similarity"] >= threshold:
-            print(f"  →  ✓ MATCHED: {best['person_name']}  "
-                  f"({best['similarity']:.4f} / {best['similarity']*100:.1f}%)")
-            status = "MATCHED"
-        else:
-            print(f"  →  ✗ NO MATCH  "
-                  f"(closest: {best['person_name']} @ {best['similarity']:.4f})")
-            status = "NOT_MATCHED"
+        # Filenames look like "<n>_unknown.jpg" — recover n to keep
+        # counting up instead of overwriting existing files.
+        try:
+            idx = int(img_path.stem.split("_")[0])
+            max_index = max(max_index, idx)
+        except ValueError:
+            pass
 
-        print("   Top candidates:")
-        for rank, r in enumerate(results[:3], 1):
-            flag = "✓" if r["similarity"] >= threshold else " "
-            print(f"     {flag}{rank}. {r['person_name']:30s}  {r['similarity']:.4f}")
-        print()
+    with _unknown_lock:
+        _unknown_db = db
+        _unknown_counter = max_index + 1
 
-        all_matches.append({
-            "detected_image": filename,
-            "matched_person": best["person_name"] if status == "MATCHED" else "UNKNOWN",
-            "similarity":     best["similarity"],
-            "status":         status,
-        })
-
-    # Summary
-    matched   = sum(1 for m in all_matches if m["status"] == "MATCHED")
-    unmatched = sum(1 for m in all_matches if m["status"] == "NOT_MATCHED")
-    no_face   = sum(1 for m in all_matches if m["status"] == "NO_FACE")
-
-    print(f"{'='*70}")
-    print("SUMMARY")
-    print(f"{'='*70}")
-    print(f"  Total processed : {len(all_matches)}")
-    print(f"  ✓ Matched       : {matched}")
-    print(f"  ✗ Not matched   : {unmatched}")
-    print(f"  ✗ No face found : {no_face}\n")
-
-    col = "{:<45} {:<20} {:<10}"
-    print(col.format("Detected Image", "Matched Person", "Similarity"))
-    print("-" * 70)
-    for m in all_matches:
-        sim = f"{m['similarity']:.4f}" if m["similarity"] else "N/A"
-        print(col.format(m["detected_image"][:44], m["matched_person"], sim))
-    print(f"{'='*70}\n")
-
-    return all_matches
+    print(f"[FACEREC] Unknown-face dedup primed with {len(db)} existing face(s).\n")
 
 
-# ============================================================================
-# RUN
-# ============================================================================
+def _find_similar_unknown(emb):
+    """Return the filename of the closest already-saved unknown face if it's
+    similar enough to count as the same person, else None."""
+    with _unknown_lock:
+        best_filename = None
+        best_similarity = -1.0
+        for filename, saved_emb in _unknown_db.items():
+            sim = _cosine(emb, saved_emb)
+            if sim > best_similarity:
+                best_similarity = sim
+                best_filename = filename
 
-if __name__ == "__main__":
-    match_all_faces(
-        source_folder=DETECTED_FACES_FOLDER,
-        known_folder=KNOWN_FACES_FOLDER,
-        threshold=MATCH_THRESHOLD,
-    )
+        if best_filename is not None and best_similarity >= UNKNOWN_DEDUP_THRESHOLD:
+            return best_filename, best_similarity
+        return None, best_similarity
+
+
+def _save_unknown(face_crop, emb):
+    """Save a newly-seen unknown face to disk and remember its embedding."""
+    global _unknown_counter
+
+    os.makedirs(UNKNOWN_FACES_FOLDER, exist_ok=True)
+
+    with _unknown_lock:
+        filename = f"{_unknown_counter}_unknown.jpg"
+        path = os.path.join(UNKNOWN_FACES_FOLDER, filename)
+        cv2.imwrite(path, face_crop)
+        _unknown_db[filename] = emb
+        _unknown_counter += 1
+
+    return path
+
+
+def identify_face(face_crop: np.ndarray) -> dict:
+    """
+    Identify a single face crop (numpy BGR array) directly from memory,
+    and fully resolve what should happen to it:
+      - a known person -> nothing is saved
+      - a new unknown face -> saved to UNKNOWN_FACES_FOLDER
+      - a repeat unknown face (already in that folder) -> skipped
+
+    Returns a dict:
+        status: "MATCHED" | "NEW_UNKNOWN" | "DUPLICATE" | "NO_FACE" | "ERROR"
+        matched_person: str (for MATCHED)
+        similarity: float (best match similarity, known or unknown context)
+        saved_path: str (present only for NEW_UNKNOWN)
+        top_candidates: list[dict] (known-face comparisons, if any ran)
+    """
+    result = {
+        "status": "ERROR",
+        "matched_person": "UNKNOWN",
+        "similarity": 0.0,
+        "saved_path": None,
+        "top_candidates": [],
+        "error": "",
+    }
+
+    if face_crop is None or face_crop.size == 0:
+        result["error"] = "Empty face crop"
+        return result
+
+    emb = _get_embedding(face_crop)
+    if emb is None:
+        result["status"] = "NO_FACE"
+        result["error"] = "No face detected in crop"
+        return result
+
+    # --- Step 1: check against known people ---
+    with _db_lock:
+        known_items = list(_known_db.items())
+
+    if known_items:
+        comparisons = [
+            {"person_name": name, "similarity": round(_cosine(emb, known_emb), 4)}
+            for name, known_emb in known_items
+        ]
+        comparisons_sorted = sorted(comparisons, key=lambda r: r["similarity"], reverse=True)
+        best = comparisons_sorted[0]
+        result["top_candidates"] = comparisons_sorted[:3]
+
+        if best["similarity"] >= MATCH_THRESHOLD:
+            result["status"] = "MATCHED"
+            result["matched_person"] = best["person_name"]
+            result["similarity"] = best["similarity"]
+            return result
+
+    # --- Step 2: not a known person — check the unknown-faces folder ---
+    dup_filename, dup_similarity = _find_similar_unknown(emb)
+
+    if dup_filename is not None:
+        result["status"] = "DUPLICATE"
+        result["matched_person"] = dup_filename
+        result["similarity"] = dup_similarity
+        return result
+
+    # --- Step 3: genuinely new unknown face — save it ---
+    saved_path = _save_unknown(face_crop, emb)
+    result["status"] = "NEW_UNKNOWN"
+    result["saved_path"] = saved_path
+    result["similarity"] = dup_similarity if dup_similarity > 0 else 0.0
+    return result
+
+
+def get_known_faces():
+    """Get list of enrolled known faces."""
+    with _db_lock:
+        return list(_known_db.keys())
+
+
+def get_unknown_face_count():
+    """Get the number of distinct unknown faces saved so far."""
+    with _unknown_lock:
+        return len(_unknown_db)

@@ -3,8 +3,8 @@ import numpy as np
 import os
 
 # ---------- CONFIG ----------
-CROPS_FOLDER = r"C:\Users\quant\OneDrive\Desktop\ROVER-FEATURE\results\face_crops"
-OUTPUT_FOLDER = r"C:\Users\quant\OneDrive\Desktop\ROVER-FEATURE\results\fresh_face"
+CROPS_FOLDER = r"C:\Users\Rajarshi\OneDrive\Desktop\Robo dog\results\face_crops"
+OUTPUT_FOLDER = r"C:\Users\Rajarshi\OneDrive\Desktop\Robo dog\results\fresh_face"
 ENHANCEMENT_METHOD = 4  # Choose method: 1-8 (see options below)
 # 1 = Basic (your current), 2 = Bilateral, 3 = Contrast, 4 = Unsharp, 
 # 5 = Multi-Channel, 6 = Multi-Scale, 7 = Morphological, 8 = Aggressive
