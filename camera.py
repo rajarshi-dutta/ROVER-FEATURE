@@ -46,6 +46,12 @@ CONF_THRESHOLD = 0.5
 _model = None
 _running = False
 
+# Shared "latest frame" buffer, updated every loop iteration. This is what
+# lets a web server re-broadcast the video without opening a second
+# connection to the ESP32-CAM (which only supports one client at a time).
+_latest_frame = None
+_latest_frame_lock = threading.Lock()
+
 # Stats (facerecog.py owns the actual saving/dedup — this just counts outcomes)
 _total_faces_detected = 0
 _total_faces_lock = threading.Lock()
@@ -138,7 +144,7 @@ def start_camera_capture():
     Connects to ESP32-CAM stream, detects faces, and identifies each
     one inline against facerecog, which handles all saving/dedup.
     """
-    global _running, _model
+    global _running, _model, _latest_frame
 
     _init_model()
 
@@ -175,6 +181,14 @@ def start_camera_capture():
                     continue
 
                 frame_count += 1
+
+                # Publish the raw frame for anything else that wants to
+                # broadcast it (e.g. stream_server.py) before running
+                # detection, so the web feed stays smooth even if detection
+                # is momentarily slow.
+                with _latest_frame_lock:
+                    _latest_frame = frame
+
                 detected, known, new_unknown, duplicate = _process_frame(frame)
 
                 if detected > 0:
@@ -237,3 +251,16 @@ def get_total_duplicate_unknown():
 
 def get_model_status():
     return _model is not None
+
+
+def get_latest_frame():
+    """
+    Return a copy of the most recent frame read from the camera, or None
+    if capture hasn't produced a frame yet. Safe to call from any thread
+    (e.g. the web streaming server) — this never opens its own connection
+    to the ESP32-CAM.
+    """
+    with _latest_frame_lock:
+        if _latest_frame is None:
+            return None
+        return _latest_frame.copy()

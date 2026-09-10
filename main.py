@@ -27,6 +27,7 @@ from camera import (
 )
 import facerecog
 from facerecog import get_known_faces, get_unknown_face_count
+from stream_server import start_stream_server
 
 
 # ============================================================================
@@ -34,9 +35,14 @@ from facerecog import get_known_faces, get_unknown_face_count
 # ============================================================================
 
 CAMERA_THREAD_NAME = "CameraCapture"
+STREAM_THREAD_NAME = "StreamServer"
 
 # Status update interval (seconds)
 STATUS_UPDATE_INTERVAL = 10
+
+# Web re-streaming server (what the web app connects to)
+STREAM_HOST = "0.0.0.0"
+STREAM_PORT = 5000
 
 # ============================================================================
 
@@ -46,6 +52,7 @@ class RoboDogCoordinator:
 
     def __init__(self):
         self.camera_thread = None
+        self.stream_thread = None
         self.running = False
         self.lock = threading.Lock()
 
@@ -80,6 +87,20 @@ class RoboDogCoordinator:
         time.sleep(1)
 
         print("[COORDINATOR] Camera thread started.\n")
+
+        # Start the web re-streaming server. It reads frames from the
+        # shared buffer camera.py publishes — it never opens its own
+        # connection to the ESP32-CAM, so the web app and face detection
+        # can run off the single camera connection at the same time.
+        print("[COORDINATOR] Starting web stream server…")
+        self.stream_thread = threading.Thread(
+            target=start_stream_server,
+            args=(STREAM_HOST, STREAM_PORT),
+            name=STREAM_THREAD_NAME,
+            daemon=True
+        )
+        self.stream_thread.start()
+        print(f"[COORDINATOR] Web feed: http://<this-machine-ip>:{STREAM_PORT}/video_feed\n")
 
         # Start status monitor
         self._monitor_status()
