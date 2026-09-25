@@ -27,7 +27,7 @@ from camera import (
 )
 import facerecog
 from facerecog import get_known_faces, get_unknown_face_count
-from stream_server import start_stream_server
+from camera_pusher import start_camera_pusher
 
 
 # ============================================================================
@@ -35,14 +35,10 @@ from stream_server import start_stream_server
 # ============================================================================
 
 CAMERA_THREAD_NAME = "CameraCapture"
-STREAM_THREAD_NAME = "StreamServer"
+STREAM_THREAD_NAME = "CameraPusher"
 
 # Status update interval (seconds)
 STATUS_UPDATE_INTERVAL = 10
-
-# Web re-streaming server (what the web app connects to)
-STREAM_HOST = "0.0.0.0"
-STREAM_PORT = 5000
 
 # ============================================================================
 
@@ -88,19 +84,18 @@ class RoboDogCoordinator:
 
         print("[COORDINATOR] Camera thread started.\n")
 
-        # Start the web re-streaming server. It reads frames from the
-        # shared buffer camera.py publishes — it never opens its own
-        # connection to the ESP32-CAM, so the web app and face detection
-        # can run off the single camera connection at the same time.
-        print("[COORDINATOR] Starting web stream server…")
+        # Start the camera pusher. It reads frames from the shared buffer
+        # camera.py publishes — it never opens its own connection to the
+        # ESP32-CAM — and POSTs them up to the Render backend, which
+        # re-serves the feed to the web dashboard from anywhere.
+        print("[COORDINATOR] Starting camera pusher…")
         self.stream_thread = threading.Thread(
-            target=start_stream_server,
-            args=(STREAM_HOST, STREAM_PORT),
+            target=start_camera_pusher,
             name=STREAM_THREAD_NAME,
             daemon=True
         )
         self.stream_thread.start()
-        print(f"[COORDINATOR] Web feed: http://<this-machine-ip>:{STREAM_PORT}/video_feed\n")
+        print("[COORDINATOR] Pushing camera feed to Render backend.\n")
 
         # Start status monitor
         self._monitor_status()
