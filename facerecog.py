@@ -17,8 +17,8 @@ This module now owns the full decision for unknown faces too:
 Usage:
     import facerecog
 
-    facerecog.init_recognition()                  # once, at startup
-    result = facerecog.identify_face(face_crop)    # per detected face
+    facerecog.init_recognition()                     # once, at startup
+    result = facerecog.identify_face(face_crop)     # per detected face
 
     result["status"] is one of:
         "MATCHED"       -> known person, already discarded (nothing saved)
@@ -49,10 +49,10 @@ load_dotenv()
 KNOWN_FACES_FOLDER = os.getenv("kface")
 UNKNOWN_FACES_FOLDER = os.getenv("uface")
 
-MATCH_THRESHOLD = 0.30           # known-face match threshold
+MATCH_THRESHOLD = 0.30              # known-face match threshold
 UNKNOWN_DEDUP_THRESHOLD = 0.35   # "same unrecognized person" threshold — stricter
-                                  # than MATCH_THRESHOLD since a false dedup-skip
-                                  # just means one fewer photo of the same stranger.
+                                # than MATCH_THRESHOLD since a false dedup-skip
+                                # just means one fewer photo of the same stranger.
 MIN_FACE_SIZE = 120
 
 # ============================================================================
@@ -113,19 +113,22 @@ def _preprocess(image: np.ndarray) -> np.ndarray:
 
 
 def _get_embedding(image: np.ndarray):
-    """Extract ArcFace embedding from a face crop (thread-safe)."""
+    """Extract ArcFace embedding from a face crop (thread-safe, with improved fallback padding)."""
     global _APP
 
     img = _preprocess(image)
 
     with _MODEL_LOCK:
+        # First try the crop directly
         faces = _APP.get(img)
 
+        # If InsightFace's internal detector fails, loosen it by padding heavily 
+        # with neutral background (gray) so it can find the face easily.
         if not faces:
             h, w = img.shape[:2]
-            pad = max(h, w) // 4
+            pad = max(h, w) // 2  # Increased padding fallback
             padded = cv2.copyMakeBorder(img, pad, pad, pad, pad,
-                                       cv2.BORDER_CONSTANT, value=(128, 128, 128))
+                                        cv2.BORDER_CONSTANT, value=(128, 128, 128))
             faces = _APP.get(padded)
 
     if not faces:

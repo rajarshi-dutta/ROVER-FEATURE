@@ -1,23 +1,8 @@
 """
-Camera Module — Raspberry Pi version
-====================================
-Captures frames from a Raspberry Pi camera, detects faces with YOLO, and
-sends each face crop directly (in memory) to facerecog.identify_face().
-
-Backends (set CAMERA_BACKEND):
-    "auto"       -> try Pi camera (Picamera2), fall back to USB/OpenCV
-    "picamera2"  -> Pi Camera Module (CSI ribbon cable)
-    "opencv"     -> USB webcam (index CAMERA_INDEX)
-
-Install (Raspberry Pi OS Bookworm):
-    sudo apt install -y python3-picamera2 python3-opencv
-    # if using a venv: python3 -m venv --system-site-packages venv
-    pip install ultralytics insightface onnxruntime python-dotenv
-
-Usage:
-    from camera import start_camera_capture
-    import threading
-    threading.Thread(target=start_camera_capture, daemon=True).start()
+Camera Module — Raspberry Pi version (Full-Frame Processing)
+============================================================
+Captures frames from a Raspberry Pi camera, runs YOLO to track/log telemetry,
+and passes the full uncropped frame directly to facerecog.identify_face().
 """
 
 from ultralytics import YOLO
@@ -34,13 +19,13 @@ load_dotenv()
 MODEL_PATH = "blacknwhite.pt"
 CAMERA_BACKEND = "auto"        # "auto" | "picamera2" | "opencv"
 CAMERA_INDEX = 0               # only used for the OpenCV/USB backend
-FRAME_SIZE = (640, 480)        # (width, height) — keep small for the Pi
-CAPTURE_DELAY = 0.03           # seconds between captured frames (smooth video)
-DETECT_DELAY = 0.05            # pause between detection passes (lets the Pi breathe)
-EXPOSURE_VALUE = 7.0           # Pi cam brightness boost, -8..8 (0 = default)
-BRIGHTNESS = 0.1               # -1..1 (0 = default)
+FRAME_SIZE = (1280, 720)       # (width, height) — 720p HD resolution
+CAPTURE_DELAY = 0.00           # seconds between captured frames
+DETECT_DELAY = 0.00            # pause between detection passes
+EXPOSURE_VALUE = 7.0           # Pi cam brightness boost
+BRIGHTNESS = 0.1               # -1..1
 CONF_THRESHOLD = 0.4
-YOLO_IMGSZ = 320               # smaller = faster on Pi (default is 640)
+YOLO_IMGSZ = 416
 # ============================================================================
 
 _model = None
@@ -61,7 +46,7 @@ _total_duplicate_lock = threading.Lock()
 
 
 # ============================================================================
-# CAMERA SOURCES (same interface: isOpened / read / release)
+# CAMERA SOURCES
 # ============================================================================
 class _PiCamSource:
     """Pi Camera Module via Picamera2."""
@@ -70,7 +55,7 @@ class _PiCamSource:
         from picamera2 import Picamera2
         self._cam = Picamera2()
         config = self._cam.create_video_configuration(
-            main={"size": FRAME_SIZE, "format": "RGB888"}  # RGB888 = BGR order, OpenCV-ready
+            main={"size": FRAME_SIZE, "format": "RGB888"}
         )
         self._cam.configure(config)
         self._cam.set_controls({
@@ -79,7 +64,7 @@ class _PiCamSource:
             "Brightness": BRIGHTNESS,
         })
         self._cam.start()
-        time.sleep(2)  # let auto-exposure settle
+        time.sleep(2)
         self._open = True
 
     def isOpened(self):
@@ -108,8 +93,8 @@ class _CvSource:
         self._cap = cv2.VideoCapture(CAMERA_INDEX)
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_SIZE[0])
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_SIZE[1])
-        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # avoid stale buffered frames
-        self._cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)  # 3 = auto on most UVC cams
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self._cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 3)
 
     def isOpened(self):
         return self._cap.isOpened()
@@ -122,7 +107,6 @@ class _CvSource:
 
 
 def _open_camera():
-    """Open the camera per CAMERA_BACKEND. Returns a source or None."""
     if CAMERA_BACKEND in ("auto", "picamera2"):
         try:
             src = _PiCamSource()
@@ -142,7 +126,7 @@ def _open_camera():
 
 
 # ============================================================================
-# DETECTION
+# DETECTION & FULL-FRAME IDENTIFICATION
 # ============================================================================
 def _init_model():
     global _model
@@ -152,66 +136,45 @@ def _init_model():
         print("[CAMERA] Model ready.\n")
 
 
-def _handle_face(face_crop):
-    global _total_known_matched, _total_new_unknown, _total_duplicate_unknown
-
-    result = facerecog.identify_face(face_crop)
-
-    if result["status"] == "MATCHED":
-        with _total_known_lock:
-            _total_known_matched += 1
-    elif result["status"] == "NEW_UNKNOWN":
-        with _total_new_unknown_lock:
-            _total_new_unknown += 1
-    elif result["status"] == "DUPLICATE":
-        with _total_duplicate_lock:
-            _total_duplicate_unknown += 1
-
-    return result
-
-
 def _process_frame(frame):
-    """Returns (faces_found, known, new_unknown, duplicate_unknown)."""
-    global _total_faces_detected
+    """Runs YOLO for tracking boxes, but passes the FULL frame to facerecog."""
+    global _total_faces_detected, _total_known_matched, _total_new_unknown, _total_duplicate_unknown
 
     if _model is None:
         return 0, 0, 0, 0
 
-    results = _model.predict(source=frame, conf=CONF_THRESHOLD,
-                             imgsz=YOLO_IMGSZ, verbose=False)
+    # Optional: YOLO prediction check to confirm a face/person is present in frame
+    results = _model.predict(source=frame, conf=CONF_THRESHOLD, imgsz=YOLO_IMGSZ, verbose=False)
     boxes = results[0].boxes.xyxy.cpu().numpy()
 
     faces = known = new_unknown = duplicate = 0
-    h, w = frame.shape[:2]
 
-    for box in boxes:
-        x1, y1, x2, y2 = map(int, box)
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-        face_crop = frame[y1:y2, x1:x2]
-
-        if face_crop.size == 0:
-            continue
-
-        faces += 1
+    if len(boxes) > 0:
+        faces = len(boxes)
         with _total_faces_lock:
-            _total_faces_detected += 1
+            _total_faces_detected += faces
 
-        result = _handle_face(face_crop)
+        # Pass the FULL frame directly to InsightFace instead of tight crops
+        result = facerecog.identify_face(frame)
 
-        if result["status"] == "MATCHED":
+        status = result.get("status")
+        if status == "MATCHED":
             known += 1
-        elif result["status"] == "NEW_UNKNOWN":
+            with _total_known_lock:
+                _total_known_matched += 1
+        elif status == "NEW_UNKNOWN":
             new_unknown += 1
-        elif result["status"] == "DUPLICATE":
+            with _total_new_unknown_lock:
+                _total_new_unknown += 1
+        elif status == "DUPLICATE":
             duplicate += 1
+            with _total_duplicate_lock:
+                _total_duplicate_unknown += 1
 
     return faces, known, new_unknown, duplicate
 
 
 def _detect_loop():
-    """Runs YOLO + face recognition on the newest frame, in its own thread,
-    so slow detection never slows the video."""
     last_id = -1
     passes = 0
     while _running:
@@ -237,7 +200,6 @@ def _detect_loop():
 
 
 def start_camera_capture():
-    """Capture loop (fast, smooth video) + a separate detection thread."""
     global _running, _latest_frame, _latest_frame_id
 
     _init_model()
@@ -333,7 +295,6 @@ def get_model_status():
 
 
 def get_latest_frame():
-    """Copy of the latest frame, or None. Thread-safe."""
     with _latest_frame_lock:
         if _latest_frame is None:
             return None
